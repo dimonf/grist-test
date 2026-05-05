@@ -5,5 +5,8 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.14"
 dependencies = [
+    "beanquery>=0.2.0",
+    "ipython>=9.13.0",
     "pygrister>=0.10.0",
+    "pyyaml>=6.0.3",
 ]

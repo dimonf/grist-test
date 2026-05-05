@@ -1,0 +1,16 @@
+tables:
+  - table_name: postings
+    columns:
+      - column_id: _year
+        fields:
+          type: Int
+          label: year
+          isFormula: true
+          formula: "$transaction_id.date.year if $transaction_id else None"
+
+      - column_id: _acc
+        fields:
+          type: Text
+          label: acc
+          isFormula: true
+          formula: "':'.join($account.split(':')[0:2])"

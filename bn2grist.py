@@ -11,10 +11,25 @@ from pathlib import Path
 
 import beanquery
 from pygrister.api import GristApi
+from requests import HTTPError
 
 
 TRANSACTIONS_TABLE = "transactions"
 POSTINGS_TABLE = "postings"
+RECORD_BATCH_SIZE = 500
+POSTINGS_COLUMN_ORDER = (
+    "transaction_id",
+    "loc",
+    "account",
+    "sub",
+    "currency",
+    "usd",
+    "number",
+)
+GRIST_TABLES_META = "_grist_Tables"
+GRIST_COLUMNS_META = "_grist_Tables_column"
+GRIST_VIEW_SECTIONS_META = "_grist_Views_section"
+GRIST_SECTION_FIELDS_META = "_grist_Views_section_field"
 
 
 @dataclass(frozen=True)
@@ -109,9 +124,12 @@ def transform_entries(bean_file: Path) -> ImportBundle:
         """
         SELECT
           id,
+          grep("/[^/]+$", location) AS loc,
           account,
+          any_meta('sub') AS sub,
           number,
-          currency
+          currency,
+          NUMBER(CONVERT(COST(position), "USD", date)) AS usd
         FROM postings
         ORDER BY date, id, account, number
         """
@@ -119,11 +137,14 @@ def transform_entries(bean_file: Path) -> ImportBundle:
     postings = [
         {
             "transaction_id": str(tr_id),
+            "loc": loc or "",
             "account": account,
+            "sub": sub or "",
             "currency": currency or "",
             "number": posting_number(number) or "",
+            "usd": posting_number(usd) or "",
         }
-        for tr_id, account, number, currency in postings_cur.fetchall()
+        for tr_id, loc, account, sub, number, currency, usd in postings_cur.fetchall()
     ]
 
     return ImportBundle(transactions=transactions, postings=postings)
@@ -218,8 +239,11 @@ def ensure_tables(api: GristApi) -> TableIds:
                             "id": "transaction_id",
                             "type": f"Ref:{transactions_id}",
                         },
+                        {"id": "loc", "type": "Text"},
                         {"id": "account", "type": "Text"},
+                        {"id": "sub", "type": "Choice"},
                         {"id": "currency", "type": "Text"},
+                        {"id": "usd", "type": "Numeric"},
                         {"id": "number", "type": "Numeric"},
                     ],
                 }
@@ -240,7 +264,11 @@ def ensure_tables(api: GristApi) -> TableIds:
             "date": {"type": "Date", "label": "date"},
             "payee": {"type": "Text", "label": "payee"},
             "narration": {"type": "Text", "label": "narration"},
-            "tags": {"type": "ChoiceList", "label": "tags", "widgetOptions": {"choices": []}},
+            "tags": {
+                "type": "ChoiceList",
+                "label": "tags",
+                "widgetOptions": {"choices": []},
+            },
             "flag": {"type": "Text", "label": "flag"},
             "tr_id": {"type": "Text", "label": "tr_id"},
         },
@@ -253,11 +281,28 @@ def ensure_tables(api: GristApi) -> TableIds:
                 "type": f"Ref:{transactions_id}",
                 "label": "transaction id",
             },
+            "loc": {"type": "Text", "label": "loc"},
             "account": {"type": "Text", "label": "account"},
+            "sub": {
+                "type": "Choice",
+                "label": "sub",
+                "widgetOptions": {"choices": []},
+            },
             "currency": {"type": "Text", "label": "currency"},
-            "number": {"type": "Numeric", "label": "number"},
+            "usd": {
+                "type": "Numeric",
+                "label": "usd",
+                "widgetOptions": {"numMode": "decimal", "decimals": 2},
+            },
+            "number": {
+                "type": "Numeric",
+                "label": "number",
+                "widgetOptions": {"numMode": "decimal", "decimals": 2},
+            },
         },
     )
+    ensure_column_order(api, postings_id, POSTINGS_COLUMN_ORDER)
+    ensure_view_section_field_order(api, postings_id, POSTINGS_COLUMN_ORDER)
 
     return TableIds(transactions=transactions_id, postings=postings_id)
 
@@ -273,13 +318,14 @@ def ensure_columns(api: GristApi, table_id: str, required: dict[str, dict]) -> N
             if column_id:
                 existing[str(column_id)] = column
 
-    missing_columns = [
-        {"id": column_id, "fields": fields}
-        for column_id, fields in required.items()
-        if column_id not in existing
-    ]
-    if missing_columns:
-        api.add_cols(table_id, missing_columns)
+    for column_id, fields in required.items():
+        if column_id not in existing:
+            call_column_api(
+                api,
+                table_id,
+                "add",
+                [{"id": column_id, "fields": column_api_fields(fields)}],
+            )
 
     columns_to_update = []
     for column_id, wanted_fields in required.items():
@@ -287,12 +333,21 @@ def ensure_columns(api: GristApi, table_id: str, required: dict[str, dict]) -> N
         if not isinstance(current, dict):
             continue
 
-        current_fields = current.get("fields", {}) if isinstance(current.get("fields"), dict) else {}
+        current_fields = (
+            current.get("fields", {}) if isinstance(current.get("fields"), dict) else {}
+        )
         current_type = current_fields.get("type") or current.get("type")
         wanted_type = wanted_fields.get("type")
         patch_fields: dict[str, object] = {}
         if wanted_type and current_type != wanted_type:
             patch_fields["type"] = wanted_type
+
+        for field_name in ("widgetOptions",):
+            if (
+                field_name in wanted_fields
+                and current_fields.get(field_name) != wanted_fields[field_name]
+            ):
+                patch_fields[field_name] = wanted_fields[field_name]
 
         current_formula = current_fields.get("formula")
         current_is_formula = current_fields.get("isFormula", current.get("isFormula"))
@@ -303,8 +358,162 @@ def ensure_columns(api: GristApi, table_id: str, required: dict[str, dict]) -> N
         if patch_fields:
             columns_to_update.append({"id": column_id, "fields": patch_fields})
 
-    if columns_to_update:
-        api.update_cols(table_id, columns_to_update)
+    for column_update in columns_to_update:
+        call_column_api(api, table_id, "update", [column_update])
+
+
+def ensure_column_order(
+    api: GristApi, table_id: str, ordered_column_ids: tuple[str, ...]
+) -> None:
+    _status, columns = api.list_cols(table_id)
+    existing: dict[str, dict] = {}
+    for column in columns:
+        if not isinstance(column, dict):
+            continue
+        column_id = column.get("id")
+        if isinstance(column_id, str):
+            existing[column_id] = column
+
+    updates = []
+    for index, column_id in enumerate(ordered_column_ids):
+        column = existing.get(column_id)
+        if column is None:
+            continue
+        current_fields = (
+            column.get("fields", {}) if isinstance(column.get("fields"), dict) else {}
+        )
+        wanted_parent_pos = float(index + 1)
+        if current_fields.get("parentPos") != wanted_parent_pos:
+            updates.append({"id": column_id, "fields": {"parentPos": wanted_parent_pos}})
+
+    for update in updates:
+        call_column_api(api, table_id, "update", [update])
+
+
+def ensure_view_section_field_order(
+    api: GristApi, table_id: str, ordered_column_ids: tuple[str, ...]
+) -> None:
+    table_ref = find_grist_table_ref(api, table_id)
+    if table_ref is None:
+        return
+
+    col_refs_by_id = find_grist_column_refs(api, table_ref)
+    ordered_col_refs = [
+        col_refs_by_id[column_id]
+        for column_id in ordered_column_ids
+        if column_id in col_refs_by_id
+    ]
+    if not ordered_col_refs:
+        return
+
+    sections = [
+        record
+        for record in list_hidden_records(api, GRIST_VIEW_SECTIONS_META)
+        if normalize_ref(record.get("tableRef")) == table_ref
+    ]
+    if not sections:
+        return
+
+    section_ids = {record["id"] for record in sections}
+    section_fields = [
+        record
+        for record in list_hidden_records(api, GRIST_SECTION_FIELDS_META)
+        if normalize_ref(record.get("parentId")) in section_ids
+    ]
+    updates: list[dict] = []
+    for section_id in section_ids:
+        fields = [
+            record
+            for record in section_fields
+            if normalize_ref(record.get("parentId")) == section_id
+        ]
+        if not fields:
+            continue
+
+        ordered_fields = sorted(fields, key=lambda record: record.get("parentPos", 0))
+        known_by_col_ref = {
+            normalize_ref(record.get("colRef")): record
+            for record in ordered_fields
+            if normalize_ref(record.get("colRef")) in ordered_col_refs
+        }
+        wanted_fields = [
+            known_by_col_ref[col_ref]
+            for col_ref in ordered_col_refs
+            if col_ref in known_by_col_ref
+        ]
+        wanted_ids = {record["id"] for record in wanted_fields}
+        wanted_fields.extend(
+            record for record in ordered_fields if record["id"] not in wanted_ids
+        )
+
+        for index, record in enumerate(wanted_fields):
+            wanted_parent_pos = float(index + 1)
+            if record.get("parentPos") != wanted_parent_pos:
+                updates.append({"id": record["id"], "parentPos": wanted_parent_pos})
+
+    if updates:
+        api.update_records(GRIST_SECTION_FIELDS_META, updates)
+
+
+def find_grist_table_ref(api: GristApi, table_id: str) -> int | None:
+    wanted = table_id.casefold()
+    for record in list_hidden_records(api, GRIST_TABLES_META):
+        current = record.get("tableId")
+        if isinstance(current, str) and current.casefold() == wanted:
+            return int(record["id"])
+    return None
+
+
+def find_grist_column_refs(api: GristApi, table_ref: int) -> dict[str, int]:
+    refs: dict[str, int] = {}
+    for record in list_hidden_records(api, GRIST_COLUMNS_META):
+        if normalize_ref(record.get("parentId")) != table_ref:
+            continue
+        col_id = record.get("colId")
+        if isinstance(col_id, str):
+            refs[col_id] = int(record["id"])
+    return refs
+
+
+def list_hidden_records(api: GristApi, table_id: str) -> list[dict]:
+    _status, records = api.list_records(table_id, hidden=True)
+    return records
+
+
+def normalize_ref(value) -> int | None:
+    if isinstance(value, int):
+        return value
+    if isinstance(value, list) and len(value) == 2 and isinstance(value[1], int):
+        return value[1]
+    return None
+
+
+def call_column_api(
+    api: GristApi, table_id: str, operation: str, columns: list[dict]
+) -> None:
+    try:
+        if operation == "add":
+            api.add_cols(table_id, columns)
+        elif operation == "update":
+            api.update_cols(table_id, columns)
+        else:
+            raise ValueError(f"Unsupported column operation: {operation}")
+    except HTTPError as exc:
+        response = getattr(api.apicaller, "response", None)
+        response_text = getattr(response, "text", "") if response is not None else ""
+        column_ids = ", ".join(str(column.get("id")) for column in columns)
+        raise RuntimeError(
+            f"Could not {operation} Grist column(s) {column_ids} on {table_id}: "
+            f"{exc}; response={response_text}; payload={columns!r}"
+        ) from exc
+
+
+def column_api_fields(fields: dict) -> dict:
+    return {
+        key: value
+        for key, value in fields.items()
+        if key in {"type", "widgetOptions", "formula", "isFormula", "parentPos"}
+    }
 
 
 def fetch_raw_records(api: GristApi, table_id: str) -> list[dict]:
@@ -321,6 +530,20 @@ def clear_table(api: GristApi, table_id: str) -> None:
         api.delete_rows(table_id, row_ids)
 
 
+def batched(values: list[dict], size: int = RECORD_BATCH_SIZE):
+    for index in range(0, len(values), size):
+        yield values[index : index + size]
+
+
+def add_records_batched(
+    api: GristApi, table_id: str, records: list[dict], noparse: bool = False
+) -> list[int]:
+    row_ids: list[int] = []
+    for batch in batched(records):
+        row_ids.extend(api.add_records(table_id, batch, noparse=noparse)[1])
+    return row_ids
+
+
 def load_transactions(
     api: GristApi, table_id: str, transactions: list[dict], replace: bool
 ) -> dict[str, int]:
@@ -335,7 +558,9 @@ def load_transactions(
     }
     new_transactions = [row for row in transactions if row["tr_id"] not in id_to_row_id]
     if new_transactions:
-        new_row_ids = api.add_records(table_id, new_transactions, noparse=True)[1]
+        new_row_ids = add_records_batched(
+            api, table_id, new_transactions, noparse=True
+        )
         for tx, row_id in zip(new_transactions, new_row_ids, strict=True):
             id_to_row_id[tx["tr_id"]] = row_id
 
@@ -352,15 +577,18 @@ def load_postings(
     if replace:
         clear_table(api, table_id)
 
-    existing_keys: set[tuple[int, str, str, str]] = set()
+    existing_keys: set[tuple[int, str, str, str, str, str, str]] = set()
     if not replace:
         existing_rows = fetch_raw_records(api, table_id)
         existing_keys = {
             (
                 row["fields"]["transaction_id"],
+                row["fields"].get("loc", ""),
                 row["fields"].get("account", ""),
+                row["fields"].get("sub", ""),
                 row["fields"].get("currency", ""),
                 str(row["fields"].get("number", "")),
+                str(row["fields"].get("usd", "")),
             )
             for row in existing_rows
             if isinstance(row.get("fields", {}).get("transaction_id"), int)
@@ -374,24 +602,30 @@ def load_postings(
             raise RuntimeError(f"Missing transaction row id for transaction {tx_id}")
         dedupe_key = (
             row_id,
+            posting["loc"],
             posting["account"],
+            posting["sub"],
             posting["currency"],
             str(posting["number"]),
+            str(posting["usd"]),
         )
         if dedupe_key in existing_keys:
             continue
         grist_postings.append(
             {
                 "transaction_id": row_id,
+                "loc": posting["loc"],
                 "account": posting["account"],
+                "sub": posting["sub"],
                 "currency": posting["currency"],
                 "number": posting["number"],
+                "usd": posting["usd"],
             }
         )
         existing_keys.add(dedupe_key)
 
     if grist_postings:
-        api.add_records(table_id, grist_postings)
+        add_records_batched(api, table_id, grist_postings)
 
 
 def run_import(args: argparse.Namespace) -> int:
